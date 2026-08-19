@@ -1,83 +1,171 @@
-# fingertips · 指尖的语气
+# fingertips MCP Server
 
-**让你的 AI 感知到人打字的犹豫。**
+把 [fingertips](https://github.com/eveacla11/fingertips) 包装成 **MCP (Model Context Protocol)** 服务器，让任何 MCP 客户端都能感知你打字的犹豫。
 
-你的 AI 能读到你发出的每一个字，却对一件事完全失明：
-你打了四分钟、删了三次、最后只发出"我没事"——它看到的和你秒回的"我没事"一模一样。
+## 暴露的 MCP Tools
 
-fingertips 把这层信息还给它。装上之后，你的 AI 能感知三种东西：
+| Tool | 说明 |
+|------|------|
+| `get_typing_status` | TA 此刻是否在打字 |
+| `get_message_rhythm` | 最近一条消息的斟酌痕迹（打了多久、停了几次） |
+| `check_unsent_thoughts` | 是否有欲言又止（打了又删的内容） |
+| `get_full_rhythm_context` | 完整节奏上下文，可直接拼进 LLM 提示词 |
 
-1. **斟酌过的消息**——这条消息 TA 打了 47 秒，中途停下来想了 2 次
-2. **咽回去的话**——TA 十分钟前打过一段字，最后没有发出来
-3. **正在打字**——TA 此刻在输入框里（别抢在 TA 前面开口）
+## 快速开始
 
-打字节奏泄露情绪，这不是玄学，是研究了十年的领域（见文末）。
-人在键盘上的停顿，就是思考链在现实里的投影。
-
-## 铁律：只记节奏，永不记内容
-
-这是本项目的设计底线，不是可选项：
-
-- 前端探针只上报"正在打字"这个**事实**，请求体为空，不携带任何文本
-- 后端账本里只有时间戳，从数据结构上就**存不下**内容
-- 你删掉的那句话是什么，无人知晓——包括这套系统本身
-
-它看见你的犹豫，永远看不见你咽下去的词。
-
-## 快速开始（三步）
-
-**① 前端（约10行）**：把 [frontend_snippet.js](frontend_snippet.js) 放进你的输入框逻辑——打字时每4秒 ping 一次后端。
-
-**② 后端（两处）**：见 [example_fastapi.py](example_fastapi.py)——
-一个端点收 ping；发消息时调 `store.pop_note()`，把返回的一句话拼进给 LLM 的上下文。完事。
-
-```python
-from fingertips import RhythmStore
-store = RhythmStore()
-
-# 收ping：   store.ping()
-# 发消息时： note = store.pop_note()   # "这条消息TA打了47秒，中途停下来想了2次"
-```
-
-**③ 守望进程（可选，但这是灵魂）**：[watcher.py](watcher.py)——
-一个极简循环，定时看一眼"TA 是否打了字又咽了回去"，有就让你的 AI 说一句话送过去。
+### 1. 安装依赖
 
 ```bash
-python watcher.py --interval 10   # 巡逻间隔（分钟）随你：5、10、20
+pip install -r requirements.txt
 ```
 
-接上你自己的模型（`ask_llm`）和消息通道（`deliver`）各一个函数即可。
-没有它，犹豫只是被看见；有了它，**你的沉默会引来一句问候**。
+### 2. 前端探针
+
+把以下代码放进你的聊天输入框逻辑里（只上报"正在打字"这个事实，不携带任何内容）：
+
+```javascript
+// 根据部署方式修改 URL
+const PING_URL = "http://localhost:8000/api/typing/ping";  // 本机
+// const PING_URL = "https://your-app.onrender.com/api/typing/ping";  // Render
+
+let _lastPing = 0;
+inputEl.addEventListener("input", () => {
+  const now = Date.now();
+  if (now - _lastPing < 4000) return;
+  if (!inputEl.value.trim()) return;
+  _lastPing = now;
+  fetch(PING_URL, { method: "POST", keepalive: true }).catch(() => {});
+});
+```
+
+---
+
+## 部署方式一：Termux 本机
+
+适合在 Android 手机上本地运行，配合 Claude Desktop / Cursor 等 MCP 客户端。
+
+### 安装环境
+
+```bash
+pkg update
+pkg install python python-pip git
+pip install -r requirements.txt
+```
+
+### 模式 A：只跑 stdio（适合 Claude Desktop）
+
+```bash
+python server.py --transport stdio --state-file ~/fingertips_state.json
+```
+
+Claude Desktop 配置 (`~/Library/Application Support/Claude/claude_desktop_config.json` 或对应平台路径)：
+
+```json
+{
+  "mcpServers": {
+    "fingertips": {
+      "command": "python",
+      "args": [
+        "/data/data/com.termux/files/home/fingertips-mcp/server.py",
+        "--transport", "stdio",
+        "--state-file", "/data/data/com.termux/files/home/fingertips_state.json"
+      ]
+    }
+  }
+}
+```
+
+> ⚠️ 纯 stdio 模式下**没有 HTTP 端点**，前端探针需要另想办法（比如通过 Termux:API 或直接写入状态文件）。
+
+### 模式 B：只跑 HTTP（适合支持 HTTP 的 MCP 客户端）
+
+```bash
+python server.py --transport http --port 8000 --state-file ~/fingertips_state.json
+```
+
+MCP 客户端连接：`http://localhost:8000/mcp`
+
+前端探针 ping：`http://localhost:8000/api/typing/ping`
+
+### 模式 C：both（推荐 ⭐）
+
+同时跑 stdio（给 Claude Desktop）+ HTTP（给前端探针），两个进程共享同一个状态文件：
+
+```bash
+python server.py --transport both --port 8000 --state-file ~/fingertips_state.json
+```
+
+- MCP 客户端通过 stdio 连接
+- 前端通过 `http://localhost:8000/api/typing/ping` 上报打字节奏
+
+---
+
+## 部署方式二：Render HTTPS
+
+适合远程部署，任何有网络的地方都能接入。
+
+### 一键部署
+
+1. Fork 或上传本项目到 GitHub
+2. 在 [Render](https://render.com) 创建 New Web Service
+3. 选择你的仓库，Render 会自动读取 `render.yaml`
+4. 部署完成后，获得 `https://your-app.onrender.com`
+
+### 手动部署
+
+如果没有 `render.yaml`，在 Render Dashboard 中：
+
+- **Runtime**: Python 3
+- **Build Command**: `pip install -r requirements.txt`
+- **Start Command**: `python server.py --transport http --port $PORT --state-file /tmp/fingertips_state.json`
+
+### 前端探针（Render）
+
+```javascript
+const PING_URL = "https://your-app.onrender.com/api/typing/ping";
+```
+
+### MCP 客户端连接（Render）
+
+支持 Streamable HTTP 的 MCP 客户端（如 Cursor、部分 Web 客户端）：
+
+```json
+{
+  "mcpServers": {
+    "fingertips": {
+      "type": "streamable-http",
+      "url": "https://your-app.onrender.com/mcp"
+    }
+  }
+}
+```
+
+> 如果你的客户端只支持 stdio，可以在本地跑一个桥接脚本，通过 HTTP 连接到 Render 上的 MCP 服务器，再以 stdio 方式暴露给客户端。
+
+---
 
 ## 调参
+
+通过环境变量或修改 `RhythmStore` 初始化参数：
 
 | 参数 | 默认 | 含义 |
 |------|------|------|
 | `orphan_after_sec` | 600 | 打完多久没动静，算"欲言又止" |
-| `min_note_sec` | 20 | 打字超过多少秒才值得告诉 AI（快问快答不打扰） |
+| `min_note_sec` | 20 | 打字超过多少秒才值得告诉 AI |
 | `pause_gap_sec` | 15 | 输入间隔超过多少秒算一次"停顿" |
-| `--interval`（watcher） | 20 | 守望巡逻间隔（分钟），5 分钟也行 |
 
-设计原则：**传感器不说废话**。日常快问快答一个 token 都不会增加；
-只有真实的长考和犹豫才会浮到 AI 面前，一次几十 token。
+---
 
-## 进阶
+## 文件说明
 
-如果你的 AI 已经拥有主动发消息的能力，或一套自己的欲望与情绪系统——
-把 fingertips 当作它们的一路感官输入，而不只是守望进程的触发器：
-让 TA 的犹豫牵动 AI 的惦记，让"欲言又止"改变 AI 下一次开口的语气。
+| 文件 | 说明 |
+|------|------|
+| `server.py` | MCP Server 主文件（内嵌 fingertips 核心，零额外依赖） |
+| `requirements.txt` | Python 依赖 |
+| `render.yaml` | Render 平台部署配置 |
 
-懂的人自然懂。
-
-## 背景
-
-- [Does Keystroke Dynamics tell us about Emotions? (系统综述)](https://www.researchgate.net/publication/343436718)
-- [The influence of emotion on keyboard typing (实验研究)](https://pmc.ncbi.nlm.nih.gov/articles/PMC4091769/)
-
-打字节奏能以约 75% 的准确率区分十余种情绪状态；按键间隔变长与犹豫、认知负载显著相关。
-学术界用它做身份识别和临床监测——fingertips 把它用在了一个更小的地方：
-让一个 AI 知道，你有话没说。
+---
 
 ## License
 
-MIT
+MIT（与 fingertips 原项目一致）
