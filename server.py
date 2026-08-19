@@ -1,38 +1,29 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""fingertips MCP Server
+"""fingertips MCP Server (Pure FastAPI, no mcp SDK dependency)
 
-把 fingertips 包装成 MCP 服务器，支持三种运行模式：
-  1. stdio         —— 本地 MCP 客户端（Claude Desktop / Cursor）
-  2. http          —— 远程部署（Render / VPS），前端通过 /api/typing/ping 上报
-  3. both          —— Termux 本机同时跑 stdio + HTTP（双进程共享状态文件）
-
-铁律：只记节奏，永不记内容。
+兼容 MCP Streamable HTTP 协议，零额外依赖（除了 fastapi/uvicorn）。
 """
 import argparse
 import asyncio
-import contextlib
 import json
-import multiprocessing
 import os
-import sys
 import time as _time
 from pathlib import Path
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI, Request, Response
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, PlainTextResponse
 
 # ---------------------------------------------------------------------------
-# 0. 全局配置
-# ---------------------------------------------------------------------------
-STATE_FILE = os.environ.get("FINGERTIPS_STATE", "fingertips_state.json")
-
-# ---------------------------------------------------------------------------
-# 1. 内嵌 fingertips 核心（零外部依赖，MIT 协议）
+# 1. 内嵌 fingertips 核心
 # ---------------------------------------------------------------------------
 PING_KEEP = 300
+STATE_FILE = os.environ.get("FINGERTIPS_STATE", "fingertips_state.json")
 
 
 class RhythmStore:
-    """打字节奏账本 —— 只记节奏，永不记内容"""
-
     def __init__(self, orphan_after_sec=600, min_note_sec=20,
                  pause_gap_sec=15, state_file=None):
         self.orphan_after = orphan_after_sec
@@ -116,196 +107,174 @@ class RhythmStore:
         return o
 
 
-# ---------------------------------------------------------------------------
-# 2. MCP Server 定义
-# ---------------------------------------------------------------------------
-from mcp.server import MCPServer
-
 store = RhythmStore(state_file=STATE_FILE)
-mcp = MCPServer("fingertips")
+
+# ---------------------------------------------------------------------------
+# 2. MCP Protocol Implementation (Pure FastAPI)
+# ---------------------------------------------------------------------------
+
+TOOLS = [
+    {
+        "name": "get_typing_status",
+        "description": "获取用户当前是否在输入框中打字。",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "get_message_rhythm",
+        "description": "提取最近一条已发送消息的打字节奏（斟酌痕迹）。",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "check_unsent_thoughts",
+        "description": "检查用户是否有\"打了又删、未发出\"的内容（欲言又止）。",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "get_full_rhythm_context",
+        "description": "获取完整的打字节奏上下文，供 AI 感受用户当前情绪状态。",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+]
 
 
-@mcp.tool()
-def get_typing_status() -> str:
-    """获取用户当前是否在输入框中打字。"""
-    status = store.peek()
-    if status["typing_now"]:
-        return "TA 此刻正在输入框里打字。"
-    return "TA 此刻没有在打字。"
+def handle_tool_call(name: str, _args: dict) -> list:
+    """执行 tool，返回 MCP content 列表"""
+    if name == "get_typing_status":
+        status = store.peek()
+        text = "TA 此刻正在输入框里打字。" if status["typing_now"] else "TA 此刻没有在打字。"
+        return [{"type": "text", "text": text}]
 
+    elif name == "get_message_rhythm":
+        note = store.pop_note()
+        if not note:
+            note = "这条消息没有犹豫痕迹，可能是快问快答。"
+        return [{"type": "text", "text": note}]
 
-@mcp.tool()
-def get_message_rhythm() -> str:
-    """提取最近一条已发送消息的打字节奏（斟酌痕迹）。
-
-    返回如："这条消息TA打了47秒，中途停下来想了2次"
-    或表示没有值得注意的犹豫痕迹。
-    """
-    note = store.pop_note()
-    if not note:
-        return "这条消息没有犹豫痕迹，可能是快问快答。"
-    return note
-
-
-@mcp.tool()
-def check_unsent_thoughts() -> str:
-    """检查用户是否有"打了又删、未发出"的内容（欲言又止）。
-
-    返回如："TA 10分钟前打过40秒的字，那条没有发出来"
-    或表示最近没有欲言又止。
-    """
-    status = store.peek()
-    orphan = status.get("orphan")
-    if not orphan:
-        return "最近没有检测到欲言又止。"
-    mins = int((_time.time() - orphan["end"]) / 60)
-    dur = int(orphan["end"] - orphan["start"])
-    store.consume_orphan()
-    return f"TA {mins}分钟前打了{dur}秒的字，最后没有发出来。"
-
-
-@mcp.tool()
-def get_full_rhythm_context() -> str:
-    """获取完整的打字节奏上下文，供 AI 感受用户当前情绪状态。
-
-    同时检查：正在打字？已发消息的节奏？欲言又止？
-    返回一段自然语言描述，可直接拼进 LLM 提示词。
-    """
-    parts = []
-    status = store.peek()
-
-    if status["typing_now"]:
-        parts.append("TA 此刻正在输入框里打字。")
-
-    note = store.pop_note()
-    if note:
-        parts.append(note)
-
-    orphan = status.get("orphan")
-    if orphan:
+    elif name == "check_unsent_thoughts":
+        status = store.peek()
+        orphan = status.get("orphan")
+        if not orphan:
+            return [{"type": "text", "text": "最近没有检测到欲言又止。"}]
         mins = int((_time.time() - orphan["end"]) / 60)
         dur = int(orphan["end"] - orphan["start"])
         store.consume_orphan()
-        parts.append(f"TA {mins}分钟前打了{dur}秒的字，最后没有发出来。")
+        return [{"type": "text", "text": f"TA {mins}分钟前打了{dur}秒的字，最后没有发出来。"}]
 
-    if not parts:
-        return "当前没有检测到打字节奏信息。"
+    elif name == "get_full_rhythm_context":
+        parts = []
+        status = store.peek()
+        if status["typing_now"]:
+            parts.append("TA 此刻正在输入框里打字。")
+        note = store.pop_note()
+        if note:
+            parts.append(note)
+        orphan = status.get("orphan")
+        if orphan:
+            mins = int((_time.time() - orphan["end"]) / 60)
+            dur = int(orphan["end"] - orphan["start"])
+            store.consume_orphan()
+            parts.append(f"TA {mins}分钟前打了{dur}秒的字，最后没有发出来。")
+        if not parts:
+            return [{"type": "text", "text": "当前没有检测到打字节奏信息。"}]
+        return [{"type": "text", "text": "\n".join(parts)}]
 
-    return "\n".join(parts)
-
-
-@mcp.resource("rhythm://status")
-def rhythm_status() -> str:
-    """当前打字节奏的原始 JSON 状态。"""
-    return json.dumps(store.peek(), ensure_ascii=False, indent=2)
-
-
-# ---------------------------------------------------------------------------
-# 3. HTTP App 工厂（FastAPI + MCP 挂载）
-# ---------------------------------------------------------------------------
-def create_http_app():
-    from fastapi import FastAPI
-    from fastapi.middleware.cors import CORSMiddleware
-
-    mcp_asgi = mcp.streamable_http_app()
-
-    @contextlib.asynccontextmanager
-    async def lifespan(app: FastAPI):
-        async with contextlib.AsyncExitStack() as stack:
-            if hasattr(mcp, "session_manager"):
-                await stack.enter_async_context(mcp.session_manager.run())
-            yield
-
-    app = FastAPI(title="fingertips MCP Server", lifespan=lifespan)
-
-    # CORS：允许前端跨域调用 ping
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=["*"],
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
-
-    # 挂载 MCP Streamable HTTP endpoint → /mcp
-    app.mount("/mcp", mcp_asgi)
-
-    @app.post("/api/typing/ping")
-    def typing_ping():
-        """前端探针：用户正在打字时每隔几秒调用一次。"""
-        store.ping()
-        return {"ok": True}
-
-    @app.get("/api/rhythm/status")
-    def http_rhythm_status():
-        """HTTP 方式查看当前节奏状态（调试用）。"""
-        return store.peek()
-
-    @app.get("/health")
-    def health():
-        return {"status": "ok"}
-
-    return app
+    return [{"type": "text", "text": f"未知工具: {name}"}]
 
 
 # ---------------------------------------------------------------------------
-# 4. 多进程辅助（both 模式）
+# 3. FastAPI App
 # ---------------------------------------------------------------------------
-def _run_stdio(state_file: str):
-    global store
-    store = RhythmStore(state_file=state_file)
-    mcp.run(transport="stdio")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    yield
+
+app = FastAPI(title="fingertips MCP Server", lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
-def _run_http(state_file: str, host: str, port: int):
-    global store
-    store = RhythmStore(state_file=state_file)
-    import uvicorn
-    app = create_http_app()
-    uvicorn.run(app, host=host, port=port)
+@app.post("/mcp")
+async def mcp_endpoint(request: Request):
+    """MCP Streamable HTTP endpoint"""
+    body = await request.json()
+    method = body.get("method")
+    req_id = body.get("id")
+
+    if method == "initialize":
+        return JSONResponse({
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": "fingertips", "version": "1.0.0"},
+            }
+        })
+
+    elif method == "tools/list":
+        return JSONResponse({
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {"tools": TOOLS}
+        })
+
+    elif method == "tools/call":
+        params = body.get("params", {})
+        name = params.get("name")
+        args = params.get("arguments", {})
+        content = handle_tool_call(name, args)
+        return JSONResponse({
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {
+                "content": content,
+                "isError": False,
+            }
+        })
+
+    else:
+        return JSONResponse({
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "error": {"code": -32601, "message": f"Method not found: {method}"}
+        })
+
+
+@app.get("/mcp")
+async def mcp_get():
+    """MCP 健康检查 / SSE 兼容"""
+    return JSONResponse({"status": "ok", "server": "fingertips-mcp"})
+
+
+@app.post("/api/typing/ping")
+def typing_ping():
+    store.ping()
+    return {"ok": True}
+
+
+@app.get("/api/rhythm/status")
+def http_rhythm_status():
+    return store.peek()
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
 
 
 # ---------------------------------------------------------------------------
-# 5. 启动入口
+# 4. 启动
 # ---------------------------------------------------------------------------
-def main():
-    ap = argparse.ArgumentParser(description="fingertips MCP Server")
-    ap.add_argument(
-        "--transport", choices=["stdio", "http", "both"], default="stdio",
-        help="stdio=本地MCP客户端  http=远程HTTP服务  both=同时跑两者（Termux推荐）"
-    )
-    ap.add_argument("--host", default="0.0.0.0", help="HTTP 监听地址")
-    ap.add_argument("--port", type=int, default=8000, help="HTTP 监听端口")
-    ap.add_argument("--state-file", default=STATE_FILE, help="状态文件路径")
-    args = ap.parse_args()
-
-    global store
-    store = RhythmStore(state_file=args.state_file)
-
-    if args.transport == "stdio":
-        mcp.run(transport="stdio")
-
-    elif args.transport == "http":
-        import uvicorn
-        app = create_http_app()
-        uvicorn.run(app, host=args.host, port=args.port)
-
-    elif args.transport == "both":
-        # Termux 推荐：stdio 给 Claude Desktop，HTTP 给前端探针
-        # 两个进程通过文件共享状态
-        ctx = multiprocessing.get_context("spawn")
-        p_stdio = ctx.Process(target=_run_stdio, args=(args.state_file,))
-        p_http = ctx.Process(target=_run_http, args=(args.state_file, args.host, args.port))
-        p_stdio.start()
-        p_http.start()
-        try:
-            p_stdio.join()
-        except KeyboardInterrupt:
-            p_stdio.terminate()
-            p_http.terminate()
-            p_stdio.join()
-            p_http.join()
-
-
 if __name__ == "__main__":
-    main()
+    import uvicorn
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--port", type=int, default=8000)
+    args = ap.parse_args()
+    uvicorn.run(app, host="0.0.0.0", port=args.port)
