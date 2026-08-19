@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: fingertips-mcp
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python server.py --transport http --port $PORT --state-file /tmp/fingertips_state.json
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.12"
